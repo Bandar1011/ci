@@ -191,6 +191,8 @@ test('wrong recipient, oversized files and symlink evidence fail without artifac
       if (kind === 'symlink') fs.symlinkSync('/etc/hosts', path.join(workspace, 'results/linked'));
       const result = f.run('encrypt-result', { SANDY_RESULT_ID: kind === 'lane' ? '../../invalid' : 'a', ...(kind === 'recipient' ? { SANDY_CI_RECIPIENT_CERT_SHA256: '0'.repeat(64) } : {}) });
       assert.notEqual(result.status, 0);
+      const phase = kind === 'recipient' ? 'certificate' : kind === 'lane' ? 'manifest' : 'tar';
+      assert.equal(result.stdout.trim(), `Private validation: failed (encryption stage ${phase})`);
       assert.ok(!fs.existsSync(path.join(workspace, 'result-a.bundle.cms')));
       assert.ok(!result.stdout.includes('private-canary'));
     } finally { f.cleanup(); }
@@ -245,4 +247,100 @@ test('Linux guard accepts hosted Node24 and rejects another major or an arbitrar
     assert.notEqual(f.run('guard', { RUNNER_OS: 'Linux', PATH: `${arbitrary}:${process.env.PATH}` }).status, 0);
     assert.ok(!fs.existsSync(path.join(f.root, 'calls.jsonl')));
   } finally { f.cleanup(); }
+});
+
+test('prepare summary hashes symlink metadata without reading outside files or following directory targets', () => {
+  const f = fixture();
+  try {
+    const workspace = prepareEvidence(f);
+    const products = path.join(workspace, 'products');
+    fs.mkdirSync(path.join(products, 'Local.product'), { recursive: true });
+    fs.writeFileSync(path.join(products, 'Local.product/binary'), 'real product bytes\n');
+    fs.writeFileSync(path.join(products, 'plain-resource'), 'real resource bytes\n');
+    const outside = path.join(f.root, 'outside'); fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'outside-sentinel-canary-92a1\n');
+    fs.symlinkSync('binary', path.join(products, 'Local.product/executable-link'));
+    fs.symlinkSync(path.join(outside, 'sentinel'), path.join(products, 'escape-file'));
+    fs.symlinkSync(outside, path.join(products, 'escape-directory'));
+    fs.symlinkSync('../../outside', path.join(products, 'relative-directory'));
+    fs.symlinkSync(path.join(outside, 'missing'), path.join(products, 'dangling-link'));
+    fs.symlinkSync('.', path.join(products, 'directory-cycle'));
+    // Observe the actual inline Python scripts: any read/list attempt outside
+    // the product tree fails this test. Link metadata reads remain permitted.
+    const python = command('which', ['python3']);
+    const attempted = path.join(f.root, 'outside-read-attempt');
+    fs.writeFileSync(path.join(f.tools, 'python3'), `#!${python}
+import os, sys
+outside = os.path.realpath(${JSON.stringify(outside)})
+attempted = ${JSON.stringify(attempted)}
+def audit(event, arguments):
+    if event not in ('open', 'os.listdir', 'os.scandir') or not arguments:
+        return
+    target = arguments[0]
+    if isinstance(target, (str, bytes, os.PathLike)):
+        resolved = os.path.realpath(os.fsdecode(target))
+        if resolved == outside or resolved.startswith(outside + os.sep):
+            descriptor = os.open(attempted, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(descriptor)
+            raise PermissionError('synthetic outside read forbidden')
+sys.addaudithook(audit)
+assert sys.argv[1] == '-'
+sys.argv = sys.argv[1:]
+exec(compile(sys.stdin.read(), '<guarded inline script>', 'exec'), {'__name__': '__main__'})
+`, { mode: 0o700 });
+    function summarize() {
+      const result = f.run('encrypt-prepare');
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(result.stdout.trim(), 'Private validation: succeeded');
+      assert.ok(!fs.existsSync(attempted), 'outside sentinel must never be opened or listed');
+      const clear = path.join(f.root, 'prepare-clear.tar.gz');
+      command('openssl', ['cms', '-decrypt', '-binary', '-inform', 'DER', '-in', path.join(workspace, 'prepare.bundle.cms'), '-recip', f.cert, '-inkey', f.key, '-out', clear]);
+      const archived = command('tar', ['-tzf', clear]).split('\n').filter(name => !name.endsWith('/')).sort();
+      assert.deepEqual(archived, ['products-evidence/candidate.json', 'products-evidence/private.log', 'products-evidence/products-manifest.json']);
+      const summary = JSON.parse(command('tar', ['-xOzf', clear, 'products-evidence/products-manifest.json']));
+      assert.equal(summary.file_count, 2, 'only real regular product files are counted');
+      assert.equal(summary.symlink_count, 6);
+      assert.ok(!JSON.stringify(summary).includes('outside-sentinel-canary'));
+      return summary;
+    }
+    const initial = summarize();
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'different outside bytes\n');
+    fs.writeFileSync(path.join(outside, 'new-outside-file'), 'must not become a product\n');
+    assert.equal(summarize().sha256, initial.sha256, 'outside contents cannot affect product summary');
+    fs.unlinkSync(path.join(products, 'dangling-link'));
+    fs.symlinkSync(path.join(outside, 'other-missing'), path.join(products, 'dangling-link'));
+    assert.notEqual(summarize().sha256, initial.sha256, 'link target text is hashed as metadata');
+  } finally { f.cleanup(); }
+});
+
+test('prepare packaging failures identify only their generic manifest or cipher phase', () => {
+  for (const kind of ['empty-products', 'root-link', 'cipher']) {
+    const f = fixture();
+    try {
+      const workspace = prepareEvidence(f);
+      const products = path.join(workspace, 'products');
+      if (kind === 'root-link') {
+        const outside = path.join(f.root, 'outside'); fs.mkdirSync(outside);
+        fs.writeFileSync(path.join(outside, 'sentinel'), 'outside-sentinel-canary-92a1\n');
+        fs.symlinkSync(outside, products);
+      } else {
+        fs.mkdirSync(products);
+      }
+      if (kind === 'cipher') {
+        fs.writeFileSync(path.join(products, 'real-product'), 'real product bytes\n');
+        const openssl = command('which', ['openssl']);
+        fs.writeFileSync(path.join(f.tools, 'openssl'), `#!/bin/bash
+if [[ "$1" == cms && "$2" == -encrypt ]]; then exit 1; fi
+exec '${openssl}' "$@"
+`, { mode: 0o700 });
+      }
+      const result = f.run('encrypt-prepare');
+      assert.notEqual(result.status, 0);
+      const phase = kind === 'cipher' ? 'cipher' : 'manifest';
+      assert.equal(result.stdout.trim(), `Private validation: failed (encryption stage ${phase})`);
+      assert.ok(!result.stdout.includes(f.root));
+      assert.ok(!result.stdout.includes('outside-sentinel-canary'));
+      assert.ok(!fs.existsSync(path.join(workspace, 'prepare.bundle.cms')));
+    } finally { f.cleanup(); }
+  }
 });
