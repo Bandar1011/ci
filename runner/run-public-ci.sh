@@ -18,6 +18,10 @@ umask 077
 mkdir -p "$WORKSPACE" >/dev/null 2>&1
 status=1
 stage=0
+encryption_stage=''
+# Bash may run EXIT while the private-log redirect is still active.
+# Only packaging modes retain a descriptor for fixed public phase markers.
+if [[ "$MODE" == encrypt-prepare || "$MODE" == encrypt-result ]]; then exec 3>&1; fi
 auth_helper=''
 revoke_on_exit=0
 revoke_source_token() {
@@ -38,6 +42,8 @@ finish() {
     echo 'Private validation: succeeded'
   elif [[ "$MODE" == fetch ]]; then
     echo "Private validation: failed (stage $stage)"
+  elif [[ "$MODE" == encrypt-* && "$encryption_stage" =~ ^(certificate|manifest|tar|cipher)$ ]]; then
+    echo "Private validation: failed (encryption stage $encryption_stage)" >&3
   else
     echo 'Private validation: failed'
   fi
@@ -137,6 +143,7 @@ safe_result_id() {
 }
 
 main() {
+  [[ "$MODE" != encrypt-* ]] || encryption_stage=certificate
   recipient_certificate >/dev/null
   if [[ "$MODE" == guard ]]; then status=0; return 0; fi
   if [[ "$MODE" == fetch ]]; then
@@ -236,37 +243,73 @@ PY
       private_exec run --lane "$SANDY_OPAQUE_LANE"
       ;;
     encrypt-prepare)
+      encryption_stage=manifest
       mkdir -p "$WORKSPACE/products-evidence"
       [[ -f "$WORKSPACE/private.log" && -f "$WORKSPACE/candidate.json" ]] || fail
       cp "$WORKSPACE/private.log" "$WORKSPACE/products-evidence/private.log"
       cp "$WORKSPACE/candidate.json" "$WORKSPACE/products-evidence/candidate.json"
       python3 - "$WORKSPACE/products" "$WORKSPACE/products-evidence/products-manifest.json" <<'PY'
-import hashlib, json, sys
+import hashlib, json, os, stat, sys
 from pathlib import Path
 root, output = Path(sys.argv[1]), Path(sys.argv[2])
+records = []
+file_count = symlink_count = 0
+
+def inspect(directory_fd, prefix=""):
+    global file_count, symlink_count
+    # Directory descriptors and O_NOFOLLOW keep traversal and hashing inside
+    # actual product directories. Link targets are metadata, never input files.
+    with os.scandir(directory_fd) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        relative = f"{prefix}/{name}" if prefix else name
+        mode = os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+        if stat.S_ISLNK(mode):
+            records.append({"path": relative, "type": "symlink", "target": os.readlink(name, dir_fd=directory_fd)})
+            symlink_count += 1
+        elif stat.S_ISDIR(mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                inspect(child, relative)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(mode):
+            item_hash = hashlib.sha256()
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise SystemExit(1)
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""): item_hash.update(chunk)
+            records.append({"path": relative, "sha256": item_hash.hexdigest()})
+            file_count += 1
+        else:
+            raise SystemExit(1)
+
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    inspect(root_fd)
+finally:
+    os.close(root_fd)
+if not file_count: raise SystemExit(1)
 digest = hashlib.sha256()
-count = 0
-for path in sorted(root.rglob("*")):
-    if path.is_symlink(): raise SystemExit(1)
-    if path.is_file():
-        item_hash = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""): item_hash.update(chunk)
-        digest.update(json.dumps({"path": path.relative_to(root).as_posix(), "sha256": item_hash.hexdigest()},
-                                sort_keys=True, separators=(",", ":")).encode())
-        count += 1
-if not count: raise SystemExit(1)
-output.write_text(json.dumps({"file_count": count, "sha256": digest.hexdigest()}, sort_keys=True) + "\n")
+for record in sorted(records, key=lambda item: item["path"]):
+    digest.update(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
+output.write_text(json.dumps({"file_count": file_count, "symlink_count": symlink_count,
+                             "sha256": digest.hexdigest()}, sort_keys=True) + "\n")
 PY
+      encryption_stage=tar
       bounded_tar products-evidence "$WORKSPACE/prepare.bundle.tar.gz"
+      encryption_stage=cipher
       encrypt_cms "$WORKSPACE/prepare.bundle.tar.gz" "$WORKSPACE/prepare.bundle.cms"
       ;;
     encrypt-result)
+      encryption_stage=manifest
       [[ -f "$WORKSPACE/private.log" && -f "$WORKSPACE/candidate.json" ]] || fail
       cp "$WORKSPACE/private.log" "$WORKSPACE/results/private.log"
       cp "$WORKSPACE/candidate.json" "$WORKSPACE/results/candidate.json"
       result_id="$(safe_result_id)"
+      encryption_stage=tar
       bounded_tar results "$WORKSPACE/result-$result_id.bundle.tar.gz"
+      encryption_stage=cipher
       encrypt_cms "$WORKSPACE/result-$result_id.bundle.tar.gz" "$WORKSPACE/result-$result_id.bundle.cms"
       ;;
   esac
