@@ -4,14 +4,7 @@ readonly WORKSPACE="${RUNNER_TEMP:?}/sandy-private"
 readonly MODE="${1:-}"
 readonly REQUEST_RE='^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
 readonly SAFE_PATH='/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-node_tool_bin=''
-if [[ "${RUNNER_OS:-}" == Linux ]]; then
-  node_binary="$(command -v node || true)"
-  [[ "$node_binary" =~ ^/opt/hostedtoolcache/node/24\.[0-9]+\.[0-9]+/x64/bin/node$ ]] || exit 1
-  [[ "$("$node_binary" --version)" =~ ^v24\.[0-9]+\.[0-9]+$ ]] || exit 1
-  node_tool_bin="${node_binary%/node}"
-fi
-readonly PRIVATE_PATH="${node_tool_bin:+$node_tool_bin:}$SAFE_PATH"
+readonly PRIVATE_PATH="$SAFE_PATH"
 export PATH="$PRIVATE_PATH"
 unset BASH_ENV ENV CDPATH GLOBIGNORE || true
 umask 077
@@ -84,7 +77,7 @@ private_exec() {
     SANDY_SOURCE_ROOT="$WORKSPACE/source" SANDY_PRIVATE_ROOT="$WORKSPACE" \
     SANDY_TEST_ARTIFACTS="$WORKSPACE/results" SANDY_TEST_DERIVED_DATA="$WORKSPACE/derived" \
     PREPARE_RESULT="${PREPARE_RESULT:-}" LANE_A_RESULT="${LANE_A_RESULT:-}" \
-    LANE_B_RESULT="${LANE_B_RESULT:-}" LANE_C_RESULT="${LANE_C_RESULT:-}" LANE_D_RESULT="${LANE_D_RESULT:-}" \
+    LANE_B_RESULT="${LANE_B_RESULT:-}" LANE_C_RESULT="${LANE_C_RESULT:-}" \
     PUBLIC_RUN_ID="${PUBLIC_RUN_ID:-}" python3 "$entrypoint" "$@"
 }
 use_isolated_keychain() {
@@ -138,7 +131,7 @@ PY
 }
 safe_result_id() {
   local value="${SANDY_RESULT_ID:-}"
-  [[ "$value" =~ ^(a|b-[1-5]|c-[1-3]|d-[1-2])$ ]] || return 1
+  [[ "$value" =~ ^(a|b-[1-5]|c-[12])$ ]] || return 1
   printf '%s' "$value"
 }
 
@@ -178,7 +171,7 @@ now = int(time.time())
 created, expires = d.get("created_at"), d.get("expires_at")
 if type(created) is not int or type(expires) is not int: raise SystemExit(1)
 if created > now + 300 or expires <= now or expires <= created or expires - created > 86_400: raise SystemExit(1)
-if d.get("expected_jobs") != ["test-products", "critical-shards", "swiftpm", "w2-gate", "release-build", "source-fast", "backend-integration"]: raise SystemExit(1)
+if d.get("expected_jobs") != ["test-products", "critical-shards", "swiftpm", "w2-gate", "release-build"]: raise SystemExit(1)
 PY
     head_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"])' "$WORKSPACE/request.json")"
     base_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$WORKSPACE/request.json")"
@@ -237,8 +230,8 @@ PY
       [[ -d "$WORKSPACE/products" ]] || fail
       ;;
     run-lane)
-      [[ "${SANDY_OPAQUE_LANE:-}" =~ ^(a|b-[1-5]|c-[1-3]|d-[1-2])$ ]] || fail
-      if [[ ! "$SANDY_OPAQUE_LANE" =~ ^d-[1-2]$ ]]; then use_isolated_keychain; fi
+      [[ "${SANDY_OPAQUE_LANE:-}" =~ ^(a|b-[1-5]|c-[12])$ ]] || fail
+      use_isolated_keychain
       if [[ "$SANDY_OPAQUE_LANE" =~ ^b-[1-5]$ ]]; then private_exec prepare; fi
       private_exec run --lane "$SANDY_OPAQUE_LANE"
       ;;
