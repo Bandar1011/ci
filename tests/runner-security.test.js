@@ -63,7 +63,7 @@ function prepareSource(f, edits = {}) {
     request_run_id: 123, head_sha: head, base_sha: base, control_workflow_sha: control, public_workflow_sha: f.env.GITHUB_SHA,
     recipient_cert_sha256: f.env.SANDY_CI_RECIPIENT_CERT_SHA256,
     created_at: Math.floor(Date.now() / 1000), expires_at: Math.floor(Date.now() / 1000) + 3600,
-    expected_jobs: ['test-products', 'critical-shards', 'swiftpm', 'w2-gate', 'release-build', 'source-fast', 'backend-integration'], ...edits,
+    expected_jobs: ['test-products', 'critical-shards', 'swiftpm', 'w2-gate', 'release-build'], ...edits,
   };
   fs.writeFileSync(path.join(f.root, 'request.json'), JSON.stringify(request));
   const gh = `#!/usr/bin/env python3
@@ -153,15 +153,15 @@ test('rerun, debug and foreign public repository fail before credential use', ()
   const f = fixture();
   try {
     prepareSource(f);
-    for (const extra of [{ GITHUB_RUN_ATTEMPT: '2' }, { RUNNER_DEBUG: '1' }, { ACTIONS_STEP_DEBUG: 'true' }, { GITHUB_REPOSITORY: 'other/ci' }, { GITHUB_REPOSITORY_ID: '1' }, { RUNNER_OS: 'Linux', PATH: '/usr/bin:/bin' }]) {
+    for (const extra of [{ GITHUB_RUN_ATTEMPT: '2' }, { RUNNER_DEBUG: '1' }, { ACTIONS_STEP_DEBUG: 'true' }, { GITHUB_REPOSITORY: 'other/ci' }, { GITHUB_REPOSITORY_ID: '1' }]) {
       assert.notEqual(f.run('fetch', { SANDY_SOURCE_TOKEN: 'synthetic-reader-token', ...extra }).status, 0);
       assert.ok(!fs.existsSync(path.join(f.root, 'calls.jsonl')));
     }
   } finally { f.cleanup(); }
 });
 
-test('real CMS encryption protects every additional UI shard and production Release evidence', () => {
-  for (const lane of ['b-4', 'b-5', 'c-3', 'd-1', 'd-2']) {
+test('real CMS encryption protects native UI and Release evidence', () => {
+  for (const lane of ['b-4', 'b-5', 'c-1', 'c-2']) {
     const f = fixture();
     try {
       const workspace = prepareEvidence(f);
@@ -201,7 +201,7 @@ test('wrong recipient, oversized files and symlink evidence fail without artifac
 
 test('all jobs validate before source App access and upload encrypted files only', () => {
   const jobs = workflow.split(/^  (?:prepare|lane-[abcd]):$/m).slice(1);
-  assert.equal(jobs.length, 5);
+  assert.equal(jobs.length, 4);
   for (const job of jobs) {
     assert.ok(job.indexOf('run-public-ci.sh guard') < job.indexOf('secrets.SANDY_SOURCE_APP_PRIVATE_KEY'));
     assert.ok(job.includes('permission-contents: read')); assert.ok(job.includes('permission-actions: read'));
@@ -209,44 +209,9 @@ test('all jobs validate before source App access and upload encrypted files only
     const upload = job.slice(job.indexOf('actions/upload-artifact@'));
     assert.ok(upload.includes('.bundle.cms')); assert.ok(!upload.includes('private.log'));
   }
-  assert.deepEqual([...workflow.matchAll(/opaque: (c-\d+)/g)].map(match => match[1]), ['c-1', 'c-2', 'c-3']);
+  assert.deepEqual([...workflow.matchAll(/opaque: (c-\d+)/g)].map(match => match[1]), ['c-1', 'c-2']);
   assert.ok(!workflow.includes('secrets.SANDY_SOURCE_TOKEN'));
   assert.ok(!workflow.includes('SANDY_CALLBACK_APP_PRIVATE_KEY'));
-});
-
-test('Linux lanes use pinned Node24 setup before auth and preserve only a validated hosted tool-cache path', () => {
-  const linux = workflow.split('  lane-d:', 2)[1];
-  assert.ok(linux.includes('runs-on: ubuntu-latest'));
-  assert.ok(!linux.includes('needs: prepare'));
-  assert.ok(linux.indexOf('actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38') < linux.indexOf('run-public-ci.sh guard'));
-  assert.ok(linux.includes("node-version: '24'"));
-  assert.deepEqual([...linux.matchAll(/opaque: (d-\d+)/g)].map(match => match[1]), ['d-1', 'd-2']);
-  assert.ok(original.includes('"$node_binary" --version'));
-  assert.ok(original.includes('^/opt/hostedtoolcache/node/24\\.[0-9]+\\.[0-9]+/x64/bin/node$'));
-  assert.ok(original.includes('if [[ ! "$SANDY_OPAQUE_LANE" =~ ^d-[1-2]$ ]]; then use_isolated_keychain; fi'));
-  assert.ok(original.includes('PATH="$PRIVATE_PATH" HOME='));
-});
-
-test('Linux guard accepts hosted Node24 and rejects another major or an arbitrary Node path before authentication', () => {
-  const f = fixture();
-  try {
-    const hostedRoot = path.join(f.root, 'hostedtoolcache');
-    const bin = path.join(hostedRoot, 'node/24.99.99/x64/bin');
-    fs.mkdirSync(bin, { recursive: true });
-    const adapted = fs.readFileSync(f.runner, 'utf8');
-    assert.equal(adapted.split('/opt/hostedtoolcache').length, 2);
-    // Only the hosted cache root is relocated for this filesystem fixture.
-    fs.writeFileSync(f.runner, adapted.replace('/opt/hostedtoolcache', hostedRoot));
-    fs.writeFileSync(path.join(bin, 'node'), '#!/bin/bash\necho v24.99.99\n', { mode: 0o700 });
-    const extra = { RUNNER_OS: 'Linux', PATH: `${bin}:${process.env.PATH}` };
-    assert.equal(f.run('guard', extra).status, 0);
-    fs.writeFileSync(path.join(bin, 'node'), '#!/bin/bash\necho v22.99.99\n');
-    assert.notEqual(f.run('guard', extra).status, 0);
-    const arbitrary = path.join(f.root, 'arbitrary-bin'); fs.mkdirSync(arbitrary);
-    fs.writeFileSync(path.join(arbitrary, 'node'), '#!/bin/bash\necho v24.99.99\n', { mode: 0o700 });
-    assert.notEqual(f.run('guard', { RUNNER_OS: 'Linux', PATH: `${arbitrary}:${process.env.PATH}` }).status, 0);
-    assert.ok(!fs.existsSync(path.join(f.root, 'calls.jsonl')));
-  } finally { f.cleanup(); }
 });
 
 test('prepare summary hashes symlink metadata without reading outside files or following directory targets', () => {
